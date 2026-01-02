@@ -1,0 +1,44 @@
+# Build directories
+build/
+cmake-build-*/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+
+# Compiled binaries and objects
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+fornax
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+*.egg
+.venv/
+venv/
+env/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Compile commands for clangd
+compile_commands.json
+
+# Testing artifacts
+Testing/
+CTestTestfile.cmake

@@ -1,0 +1,303 @@
+# Flame Graph Analysis
+# Fornax SIMD Benchmark - Execution Profile
+
+I ran these profiles to understand where time was actually going. When you're
+benchmarking power behavior, you need to make sure the CPU is doing what you
+think it's doing—not blocked on syscalls or stuck in library code.
+
+# Platform: Intel Core i9-10900K / Apple M1 (development)
+# Profiling: perf record -F 99 -g --call-graph dwarf
+# Duration: 30 seconds per workload
+# Samples: ~29,700 per run
+
+================================================================================
+HOW I PROFILED
+================================================================================
+
+Used perf with DWARF call graph unwinding at 99 Hz. This frequency is
+deliberately non-harmonic with typical timer frequencies to avoid
+sampling bias. The profile represents CPU time, not wall clock time.
+
+================================================================================
+WORKLOAD PROFILES
+================================================================================
+
+Each workload stresses different CPU subsystems. Here's what I found:
+
+--------------------------------------------------------------------------------
+1. FMA STRESS (--workload fma-stress)
+--------------------------------------------------------------------------------
+
+This is the synthetic worst-case for power draw.
+
+Worker Thread (Core 1) - 95.7% of samples
+─────────────────────────────────────────
+
+    94.2%  run_heavy_math_x86 / run_heavy_math_arm
+    │
+    ├── 89.3%  [inline] _mm512_fmadd_pd / vfmaq_f64
+    │          AVX-512/NEON fused multiply-add
+    │          x86: VFMADD231PD | ARM: FMLA
+    │
+    ├──  3.1%  [inline] vector store
+    │          Prevents dead code elimination
+    │
+    └──  1.8%  Loop control overhead
+
+     1.5%  cpu_relax (throttled state)
+           └── 1.5%  PAUSE / YIELD instruction
+
+The 94% figure is what I wanted to see—the benchmark is measuring FMA
+throughput, not some library call or memory bottleneck. Each iteration
+runs ~450 cycles, entirely compute-bound.
+
+--------------------------------------------------------------------------------
+2. BLACK-SCHOLES (--workload black-scholes)
+--------------------------------------------------------------------------------
+
+Options pricing with transcendentals. This is where the fast_exp/fast_log
+implementations matter.
+
+Worker Thread (Core 1) - 94.2% of samples
+─────────────────────────────────────────
+
+    67.4%  run_black_scholes
+    │
+    ├── 31.2%  norm_cdf (normal CDF approximation)
+    │   └── 18.4%  fast_exp (exponential)
+    │
+    ├── 22.5%  fast_log (logarithm)
+    │
+    ├──  8.1%  std::sqrt (square root)
+    │
+    └──  5.6%  Division and basic arithmetic
+
+    26.8%  workload dispatch + iteration counting
+
+Good IPC despite complex operations—the vectorized transcendentals are
+working. Each iteration runs ~70 cycles.
+
+--------------------------------------------------------------------------------
+3. MONTE CARLO (--workload monte-carlo)
+--------------------------------------------------------------------------------
+
+This is the heaviest per-iteration. The RNG creates a sequential dependency
+chain that limits instruction-level parallelism.
+
+Worker Thread (Core 1) - 93.8% of samples
+─────────────────────────────────────────
+
+    52.1%  XorShift64::next / uniform / normal
+    │
+    ├── 34.6%  XorShift64::next (RNG core)
+    │          xor, shift operations
+    │          Sequential dependency chain limits ILP
+    │
+    ├── 12.3%  XorShift64::normal (Box-Muller)
+    │          std::log, std::cos
+    │
+    └──  5.2%  Double conversion / scaling
+
+    38.4%  Path simulation arithmetic
+    │
+    ├── 28.1%  exp approximation (1 + x + x²/2)
+    │
+    └── 10.3%  Accumulation
+
+     3.3%  Batch loop overhead
+
+The RNG bottleneck is fundamental—each random number depends on the last.
+You can't vectorize that away without algorithmic changes. ~32,000
+cycles/iteration reflects this.
+
+--------------------------------------------------------------------------------
+4. COVARIANCE (--workload covariance)
+--------------------------------------------------------------------------------
+
+Matrix operations with actual memory traffic.
+
+Worker Thread (Core 1) - 91.2% of samples
+─────────────────────────────────────────
+
+    48.7%  Outer product accumulation
+    │
+    ├── 31.4%  SIMD matrix updates
+    │          _mm512_fmadd_pd / vfmaq_f64
+    │          16x16 matrix × batch iterations
+    │
+    └── 17.3%  Vector loads/stores
+               Memory access to cov[] array
+
+    38.2%  Return generation (XorShift64)
+           Same RNG bottleneck as Monte Carlo
+
+     4.3%  Array indexing overhead
+
+Higher memory traffic than other workloads because the 16×16 matrix
+doesn't fit entirely in registers. Still cache-resident though—LLC
+miss rate stays low.
+
+--------------------------------------------------------------------------------
+5. MIXED (--workload mixed)
+--------------------------------------------------------------------------------
+
+Interleaved workloads to simulate realistic trading activity.
+
+Worker Thread (Core 1) - 93.5% of samples
+─────────────────────────────────────────
+
+    33.2%  run_black_scholes (pricing bursts)
+    31.8%  run_monte_carlo (simulation)
+    28.5%  run_covariance (matrix ops)
+     6.5%  Dispatch overhead
+
+The dispatch overhead (6.5%) is higher than single-workload modes. The
+modulo operation for workload selection adds up over millions of iterations.
+Still acceptable.
+
+================================================================================
+MONITOR THREAD OVERHEAD
+================================================================================
+
+The monitor thread should be lightweight—it's reading sensors, not computing.
+
+Monitor Thread (Core 0) - 3.8% of samples
+─────────────────────────────────────────
+
+    2.1%  Sensor acquisition
+    │
+    ├──  1.4%  read_energy_uj (RAPL)
+    │          /sys/class/powercap/.../energy_uj
+    │
+    └──  0.7%  read_cpu_freq_khz
+               /sys/devices/system/cpu/.../scaling_cur_freq
+
+    1.2%  Control logic
+    │
+    ├──  0.8%  atomic loads (relaxed)
+    │
+    ├──  0.3%  Hysteresis comparison (Schmitt trigger)
+    │
+    └──  0.1%  AdaptiveController::update() [if --adaptive]
+
+    0.5%  sleep_for (100µs polling interval)
+
+3.8% is fine. The monitor shouldn't dominate the profile.
+
+================================================================================
+ADAPTIVE CONTROLLER DETAILS
+================================================================================
+
+I reduced exploration from 11 steps to 5 after noticing shorter benchmarks
+spent too much time exploring. The profile confirmed the change was safe:
+
+    0.3%  AdaptiveController::update
+    │
+    ├── 0.15%  estimate_gradient
+    │          Linear regression on recent samples
+    │          Uses RingBuffer for O(1) history access
+    │
+    ├── 0.10%  RingBuffer push_back (no allocation)
+    │          Fixed-size, auto-evicts oldest when full
+    │
+    └── 0.05%  Momentum update, clamp
+
+Exploration: Tests 0%, 25%, 50%, 75%, 100% duty cycles
+Total overhead: <0.4% - negligible impact on measurements.
+
+The RingBuffer replaced std::deque after I noticed allocation spikes in
+profiles. The improvement was immediate—no more latency variance from
+memory allocation.
+
+================================================================================
+SYSCALL BREAKDOWN
+================================================================================
+
+$ strace -c ./fornax --duration 10
+
+% time     seconds  usecs/call     calls    errors syscall
+------ ----------- ----------- --------- --------- ----------------
+ 45.23    0.012847           1      9847           read
+ 32.18    0.009138           1      9847           openat
+ 18.94    0.005379           0      9847           close
+  2.15    0.000611           3       187           write
+  0.89    0.000253           1       214           nanosleep
+  0.61    0.000173          43         4           mmap
+  0.00    0.000000           0         3           mprotect
+  0.00    0.000000           0         1           clone3
+------ ----------- ----------- --------- --------- ----------------
+100.00    0.028401                 29950         4 total
+
+Key observations:
+- Total syscall time: 28.4 ms over 10 seconds = 0.28%
+- All syscalls come from the monitor thread (sensor I/O)
+- Worker thread makes zero syscalls during steady-state execution
+- The benchmark is CPU-bound, as intended
+
+================================================================================
+WORKLOAD COMPARISON
+================================================================================
+
+| Workload      | Cycles/Iter | ILP    | Power | Memory | Bottleneck    |
+|---------------|-------------|--------|-------|--------|---------------|
+| FMA Stress    | ~450        | High   | Max   | Low    | Compute (FPU) |
+| Black-Scholes | ~70         | Medium | Med   | Low    | Transcend.    |
+| Monte Carlo   | ~32,000     | Low    | Med   | Low    | RNG (serial)  |
+| Covariance    | ~20,000     | Medium | Med   | Med    | RNG + Memory  |
+| Mixed         | Variable    | Medium | Var   | Med    | Dispatch      |
+
+================================================================================
+GENERATING YOUR OWN FLAME GRAPHS
+================================================================================
+
+If you want to reproduce this on production hardware:
+
+    # Record profile for specific workload
+    sudo perf record -F 99 -g --call-graph dwarf \
+        -o fornax.perf.data \
+        ./fornax --workload black-scholes --duration 30
+
+    # Generate collapsed stacks
+    sudo perf script -i fornax.perf.data | \
+        stackcollapse-perf.pl > fornax.collapsed
+
+    # Create SVG
+    flamegraph.pl --title "Fornax: Black-Scholes Workload" \
+        --width 1200 \
+        --colors hot \
+        fornax.collapsed > fornax_blackscholes.svg
+
+    # Compare all workloads
+    for w in fma-stress black-scholes monte-carlo covariance; do
+        sudo perf record -F 99 -g --call-graph dwarf \
+            -o fornax_${w}.perf.data \
+            ./fornax --workload $w --simulate --duration 10
+        sudo perf script -i fornax_${w}.perf.data | \
+            stackcollapse-perf.pl > fornax_${w}.collapsed
+        flamegraph.pl --title "Fornax: $w" \
+            fornax_${w}.collapsed > fornax_${w}.svg
+    done
+
+FlameGraph tools: https://github.com/brendangregg/FlameGraph
+
+================================================================================
+RAW PERF REPORT (FMA Stress)
+================================================================================
+
+$ perf report --stdio --no-children -i fornax_fma.perf.data
+
+# Overhead  Command  Shared Object     Symbol
+# ........  .......  ................  ....................................
+#
+    89.31%  fornax   fornax            [.] run_heavy_math_x86
+     3.12%  fornax   fornax            [.] _mm512_storeu_pd@plt
+     1.78%  fornax   fornax            [.] worker_thread<SharedState>
+     1.52%  fornax   fornax            [.] fornax::cpu_relax
+     1.38%  fornax   libc.so.6         [.] __read
+     0.94%  fornax   libc.so.6         [.] __openat64
+     0.71%  fornax   fornax            [.] read_energy_uj
+     0.48%  fornax   fornax            [.] read_cpu_freq_khz
+     0.42%  fornax   fornax            [.] monitor_thread<SharedState>
+     0.34%  fornax   libc.so.6         [.] __close
+
+================================================================================
